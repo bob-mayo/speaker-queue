@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Discussion Group Speaker Queue</title>
+  <!-- React + Babel (standalone so this single file “just works”) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+  <!-- Tailwind CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <div id="root" class="min-h-screen bg-gray-100 flex justify-center items-start p-4"></div>
+
+  <script type="text/babel">
+    /***********************
+     * Robust storage utils
+     ***********************/
+    const makeStorage = (kind) => {
+      let memory = {};
+      let store = null;
+      try {
+        store = kind === 'local' ? window.localStorage : window.sessionStorage;
+        // sanity test (some environments say they exist but throw on setItem)
+        const testKey = '__test_' + Math.random().toString(36).slice(2);
+        store.setItem(testKey, '1');
+        store.removeItem(testKey);
+      } catch {
+        store = null;
+      }
+      return {
+        get(key) {
+          if (!store) return memory[key] ?? null;
+          try { return store.getItem(key); } catch { return memory[key] ?? null; }
+        },
+        set(key, val) {
+          if (!store) { memory[key] = val; return; }
+          try { store.setItem(key, val); } catch { memory[key] = val; }
+        },
+        remove(key) {
+          if (!store) { delete memory[key]; return; }
+          try { store.removeItem(key); } catch { delete memory[key]; }
+        }
+      };
+    };
+
+    const lstore = makeStorage('local');   // students, speakers (shared)
+    const sstore = makeStorage('session'); // sessionUser (per tab)
+
+    const safeParse = (str, fallback) => {
+      try {
+        const v = JSON.parse(str);
+        return Array.isArray(fallback) && !Array.isArray(v) ? fallback : (v ?? fallback);
+      } catch {
+        return fallback;
+      }
+    };
+
+    // Students & speakers
+    const getStudents = () => safeParse(lstore.get('students'), []);
+    const setStudents = (arr) => lstore.set('students', JSON.stringify(arr ?? []));
+
+    const getSpeakers = () => safeParse(lstore.get('speakers'), []);
+    const setSpeakers = (arr) => lstore.set('speakers', JSON.stringify(arr ?? []));
+
+    // Per-tab session (NOT shared)
+    const getSessionUser = () => sstore.get('sessionUser') || null;
+    const setSessionUser = (u) => sstore.set('sessionUser', u);
+    const clearSessionUser = () => sstore.remove('sessionUser');
+
+    // URL helpers
+    const params = new URLSearchParams(window.location.search);
+    const isQueueMode = () => params.get('queue') === '1';
+    const isManageMode = () => params.get('manage') === '1';
+    const isEditMode = () => params.get('edit') === '1';
+
+    // Child asks parent for current session (one-time copy)
+    window.addEventListener('message', (e) => {
+      if (e?.data?.type === 'REQUEST_SESSION') {
+        try {
+          e.source?.postMessage({ type: 'SESSION_DATA', user: getSessionUser() }, '*');
+        } catch {}
+      }
+    });
+
+    /***********************
+     * Small UI helpers
+     ***********************/
+    const ErrorText = ({children}) => (
+      <p className="text-red-600 text-sm mb-3">{children}</p>
+    );
+
+    const Field = ({value, onChange, placeholder, type='text', className=''}) => (
+      <input
+        type={type}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder={placeholder}
+        className={`w-full p-2 border rounded focus:outline-none focus:ring-2 focus:ring-blue-500 ${className}`}
+      />
+    );
+
+    /***********************
+     * Auth & Registration
+     ***********************/
+    function LoginScreen({ onLogin, onShowRegister }) {
+      const [username, setUsername] = React.useState('');
+      const [password, setPassword] = React.useState('');
+      const [error, setError] = React.useState('');
+
+      const validate = () => {
+        const u = username.trim();
+        const p = password.trim();
+        if (!u || !p) return 'Username and password are required.';
+        return '';
+      };
+
+      const handleLogin = () => {
+        const msg = validate();
+        if (msg) { setError(msg); return; }
+
+        const u = username.trim();
+        const p = password.trim();
+        const match = getStudents().find(s => s.username === u && s.password === p);
+        if (match || (u === 'admin' && p === 'admin123')) {
+          setSessionUser(u); // per-tab session only
+          onLogin(u);
+        } else {
+          setError('Invalid username or password.');
+        }
+      };
+
+      return (
+        <div className="w-full max-w-md bg-white p-6 rounded-lg shadow-md">
+          <h2 className="text-2xl font-bold mb-2">Login</h2>
+          <p className="text-sm text-gray-600 mb-4">
+            Don’t have an account?{' '}
+            <button className="text-blue-600 underline" onClick={onShowRegister}>
+              Create an account
+            </button>
+          </p>
+          {error && <ErrorText>{error}</ErrorText>}
+          <Field value={username} onChange={setUsername} placeholder="Username" className="mb-3" />
+          <Field value={password} onChange={setPassword} placeholder="Password" type="password" className="mb-4" />
+          <button onClick={handleLogin} className="w-full px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">
+            Login
+          </button>
+        </div>
+      );
+    }
+
+    function RegisterScreen({ onRegistered, onCancel }) {
+      const [username, setU] = React.useState('');
+      const [password, setP] = React.useState('');
+      const [confirm, setC] = React.useState('');
+      const [error, setError] = React.useState('');
+
+      const validate = () => {
+        const u = username.trim();
+        const p = password.trim();
+        const c = confirm.trim();
+        if (!u || !p) return 'Username and password are required.';
+        if (/\s/.test(u)) return 'Username cannot contain spaces.';
+        if (u.length < 3 || u.length > 32) return 'Username must be 3–32 characters.';
+        if (p.length < 3 || p.length > 64) return 'Password must be 3–64 characters.';
+        if (p !== c) return 'Passwords do not match.';
+        if (u === 'admin') return 'That username is reserved.';
+        if (getStudents().some(s => s.username === u)) return 'That username is already taken.';
+        return '';
+      };
+
+      const handleRegister = () => {
+        const msg = validate();
+        if (msg) { setError(msg); return; }
+        const u = username.trim(); const p = password.trim();
+        const updated = [...getStudents(), { username: u, password: p }];
+        setStudents(updated);
+        setSessionUser(u); // logged in in this tab
+        onRegistered(u);
+      };
+
+      return (
+        <div className="w-full max-w-md bg-white p-6 rounded-lg shadow-md">
+          <h2 className="text-2xl font-bold mb-2">Create Account</h2>
+          <p className="text-sm text-gray-600 mb-4">
+            Already have an account?{' '}
+            <button className="text-blue-600 underline" onClick={onCancel}>
+              Back to login
+            </button>
+          </p>
+          {error && <ErrorText>{error}</ErrorText>}
+          <Field value={username} onChange={setU} placeholder="Choose a username" className="mb-3" />
+          <Field value={password} onChange={setP} placeholder="Choose a password" type="password" className="mb-3" />
+          <Field value={confirm} onChange={setC} placeholder="Confirm password" type="password" className="mb-4" />
+          <button onClick={handleRegister} className="w-full px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700">
+            Create Account
+          </button>
+        </div>
+      );
+    }
+
+    /***********************
+     * Read-only Public Queue
+     ***********************/
+    function PublicQueueView() {
+      const [speakers, setSpeakersState] = React.useState(getSpeakers());
+
+      React.useEffect(() => {
+        const onStorage = (e) => {
+          if (e.key === 'speakers') setSpeakersState(safeParse(e.newValue, []));
+        };
+        window.addEventListener('storage', onStorage);
+        const iv = setInterval(() => setSpeakersState(getSpeakers()), 2000);
+        return () => { window.removeEventListener('storage', onStorage); clearInterval(iv); };
+      }, []);
+
+      return (
+        <div className="w-full max-w-xl text-center">
+          <h1 className="text-3xl font-bold mb-4">Current Speaker Queue</h1>
+          <ul className="space-y-4">
+            {speakers.length === 0 ? (
+              <li className="text-gray-500 text-lg">No speakers in the queue</li>
+            ) : (
+              speakers.map((s, i) => {
+                const text = `${s.username} (${s.commentType || ''})`;
+                if (i === 0) {
+                  return (
+                    <li key={i} className="p-3 bg-white rounded shadow text-2xl font-bold flex justify-center items-center gap-2">
+                      <span className="font-extrabold">Next:</span>
+                      <span>{text}</span>
+                    </li>
+                  );
+                }
+                return (
+                  <li key={i} className="p-3 bg-white rounded shadow text-xl font-bold">{text}</li>
+                );
+              })
+            )}
+          </ul>
+        </div>
+      );
+    }
+
+    /***********************
+     * Speaker List
+     ***********************/
+    function SpeakerList({ speakers, onAddSpeaker, onRemoveSpeaker, user, showTitle }) {
+      const handleAdd = (commentType) => {
+        const u = user?.trim();
+        if (!u || u === 'admin') return;
+        if (speakers.some(s => s.username === u)) return; // prevent duplicate in queue
+        onAddSpeaker(u, commentType);
+      };
+
+      return (
+        <div className="w-full max-w-md bg-white p-4 rounded-lg shadow-md mb-4">
+          {showTitle && <h2 className="text-xl font-bold mb-4">{showTitle}</h2>}
+          {user !== 'admin' && (
+            <div className="flex mb-4 space-x-2">
+              <button
+                onClick={() => handleAdd('Short Comment')}
+                className="flex-1 px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
+              >
+                Add me for a short comment
+              </button>
+              <button
+                onClick={() => handleAdd('Long Comment')}
+                className="flex-1 px-4 py-2 bg-purple-600 text-white rounded hover:bg-purple-700"
+              >
+                Add me for a long comment
+              </button>
+            </div>
+          )}
+          <ul className="space-y-2">
+            {speakers.length === 0 ? (
+              <li className="text-gray-500">No speakers in the queue</li>
+            ) : (
+              speakers.map((speaker, index) => (
+                <li
+                  key={index}
+                  className={`flex justify-between items-center p-2 bg-gray-50 rounded ${index === 0 ? 'font-bold text-lg text-center' : ''}`}
+                >
+                  {index === 0
+                    ? `Next: ${speaker.username} (${speaker.commentType || ''})`
+                    : `${speaker.username} (${speaker.commentType || ''})`}
+                  {user === 'admin' && (
+                    <button
+                      onClick={() => onRemoveSpeaker(index)}
+                      className="px-2 py-1 bg-red-600 text-white rounded hover:bg-red-700"
+                      aria-label={`Delete ${speaker.username}`}
+                      title="Delete"
+                    >
+                      Delete
+                    </button>
+                  )}
+                </li>
+              ))
+            )}
+          </ul>
+        </div>
+      );
+    }
+
+    /***********************
+     * Turn Notification
+     ***********************/
+    function TurnNotification({ user, speakers, onStartSpeaking }) {
+      if (speakers[0]?.username === user) {
+        return (
+          <div className="fixed top-4 left-1/2 -translate-x-1/2 bg-yellow-400 text-black p-4 rounded-lg shadow-lg text-center">
+            <p className="text-lg font-bold">
+              Your turn to speak is next ({speakers[0].commentType || ''})
+            </p>
+            <button
+              onClick={() => onStartSpeaking(0)}
+              className="mt-2 px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700"
+            >
+              Start Speaking
+            </button>
+          </div>
+        );
+      }
+      return null;
+    }
+
+    /***********************
+     * Admin: Manage Speakers (with inline edit)
+     ***********************/
+    function AdminPanel({ students, setStudentsState }) {
+      const [newUsername, setNewUsername] = React.useState('');
+      const [newPassword, setNewPassword] = React.useState('');
+      const [error, setError] = React.useState('');
+      const [editIndex, setEditIndex] = React.useState(null);
+      const [editUsername, setEditUsername] = React.useState('');
+      const [editPassword, setEditPassword] = React.useState('');
+
+      const validateNew = (u, p) => {
+        if (!u || !p) return 'Username and password are required.';
+        if (/\s/.test(u)) return 'Username cannot contain spaces.';
+        if (u.length < 3 || u.length > 32) return 'Username must be 3–32 characters.';
+        if (p.length < 3 || p.length > 64) return 'Password must be 3–64 characters.';
+        if (u === 'admin') return 'That username is reserved.';
+        if (students.some(s => s.username === u)) return 'That username already exists.';
+        return '';
+      };
+      const validateEdit = (idx, u, p) => {
+        if (!u || !p) return 'Username and password are required.';
+        if (/\s/.test(u)) return 'Username cannot contain spaces.';
+        if (u.length < 3 || u.length > 32) return 'Username must be 3–32 characters.';
+        if (p.length < 3 || p.length > 64) return 'Password must be 3–64 characters.';
+        if (u === 'admin' && students[idx].username !== 'admin') return 'Admin is reserved.';
+        if (u !== students[idx].username && students.some(s => s.username === u)) return 'That username already exists.';
+        return '';
+      };
+
+      const addStudent = () => {
+        const u = newUsername.trim(); const p = newPassword.trim();
+        const msg = validateNew(u, p);
+        if (msg) { setError(msg); return; }
+        const updated = [...students, { username: u, password: p }];
+        setStudentsState(updated); setStudents(updated);
+        setNewUsername(''); setNewPassword(''); setError('');
+      };
+
+      const deleteStudent = (index) => {
+        if (!confirm(`Delete user "${students[index].username}"?`)) return;
+        const updated = students.filter((_, i) => i !== index);
+        setStudentsState(updated); setStudents(updated);
+      };
+
+      const startEdit = (index) => {
+        setEditIndex(index);
+        setEditUsername(students[index].username);
+        setEditPassword(students[index].password);
+        setError('');
+      };
+
+      const saveEdit = () => {
+        const u = editUsername.trim(); const p = editPassword.trim();
+        const msg = validateEdit(editIndex, u, p);
+        if (msg) { setError(msg); return; }
+        const updated = [...students];
+        updated[editIndex] = { username: u, password: p };
+        setStudentsState(updated); setStudents(updated);
+        setEditIndex(null); setError('');
+      };
+
+      const cancelEdit = () => { setEditIndex(null); setError(''); };
+
+      return (
+        <div className="w-full max-w-md bg-white p-4 rounded-lg shadow-md mb-4">
+          <h2 className="text-xl font-bold mb-4">Manage Speakers</h2>
+
+          {error && <ErrorText>{error}</ErrorText>}
+
+          <div className="flex mb-4">
+            <Field value={newUsername} onChange={setNewUsername} placeholder="New username" className="rounded-r-none" />
+            <Field value={newPassword} onChange={setNewPassword} placeholder="New password" type="password" className="rounded-none" />
+            <button onClick={addStudent} className="px-4 py-2 bg-green-600 text-white rounded-r-md hover:bg-green-700">
+              Add
+            </button>
+          </div>
+
+          <table className="w-full table-auto border-collapse border border-gray-300">
+            <thead>
+              <tr>
+                <th className="border border-gray-300 px-2 py-1 text-left">Username</th>
+                <th className="border border-gray-300 px-2 py-1 text-left">Password</th>
+                <th className="border border-gray-300 px-2 py-1 text-center">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {students.length === 0 ? (
+                <tr>
+                  <td colSpan="3" className="text-gray-500 px-2 py-2 text-center">No speakers registered</td>
+                </tr>
+              ) : (
+                students.map((student, index) => (
+                  <tr key={index}>
+                    <td className="border border-gray-300 px-2 py-1">
+                      {editIndex === index ? (
+                        <Field value={editUsername} onChange={setEditUsername} placeholder="Username" />
+                      ) : student.username}
+                    </td>
+                    <td className="border border-gray-300 px-2 py-1">
+                      {editIndex === index ? (
+                        <Field value={editPassword} onChange={setEditPassword} placeholder="Password" type="text" />
+                      ) : student.password}
+                    </td>
+                    <td className="border border-gray-300 px-2 py-1 text-center space-x-2">
+                      {editIndex === index ? (
+                        <>
+                          <button onClick={saveEdit} className="px-2 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">Save</button>
+                          <button onClick={cancelEdit} className="px-2 py-1 bg-gray-500 text-white rounded hover:bg-gray-600">Cancel</button>
+                        </>
+                      ) : (
+                        <>
+                          <button onClick={() => startEdit(index)} className="px-2 py-1 bg-yellow-500 text-white rounded hover:bg-yellow-600">Edit</button>
+                          <button onClick={() => deleteStudent(index)} className="px-2 py-1 bg-red-600 text-white rounded hover:bg-red-700">Delete</button>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    /***********************
+     * Admin Menu (opens in new tab; child copies session once)
+     ***********************/
+    function AdminMenu() {
+      const openInNewTab = (search) => {
+        const url = new URL(window.location.href);
+        url.search = search + (search.includes('?') ? '&' : '?') + 'copySession=1';
+        window.open(url.toString(), '_blank');
+      };
+      return (
+        <div className="w-full max-w-lg bg-white p-6 rounded-lg shadow-md">
+          <h2 className="text-2xl font-bold mb-6 text-center">Admin Menu</h2>
+          <div className="grid gap-4">
+            <button onClick={() => openInNewTab('?manage=1')} className="w-full px-4 py-3 bg-blue-600 text-white rounded hover:bg-blue-700 text-lg">
+              Manage Speakers
+            </button>
+            <button onClick={() => openInNewTab('?edit=1')} className="w-full px-4 py-3 bg-indigo-600 text-white rounded hover:bg-indigo-700 text-lg">
+              Edit Queue
+            </button>
+            <button onClick={() => openInNewTab('?queue=1')} className="w-full px-4 py-3 bg-green-600 text-white rounded hover:bg-green-700 text-lg">
+              View Queue
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    /***********************
+     * App Shell
+     ***********************/
+    function App() {
+      // Public queue: no login required, always read-only
+      if (isQueueMode()) {
+        return (
+          <div className="flex flex-col items-center w-full">
+            <PublicQueueView />
+          </div>
+        );
+      }
+
+      // If opened from Admin Menu, copy session once from opener
+      React.useEffect(() => {
+        if (params.get('copySession') === '1' && window.opener) {
+          const onMsg = (e) => {
+            if (e?.data?.type === 'SESSION_DATA' && e.data.user) {
+              setSessionUser(e.data.user);
+              setUser(e.data.user);
+            }
+          };
+          window.addEventListener('message', onMsg);
+          try { window.opener.postMessage({ type: 'REQUEST_SESSION' }, '*'); } catch {}
+          const t = setTimeout(() => window.removeEventListener('message', onMsg), 5000);
+          return () => { clearTimeout(t); window.removeEventListener('message', onMsg); };
+        }
+      }, []);
+
+      // State
+      const [user, setUser] = React.useState(getSessionUser());
+      const [students, setStudentsState] = React.useState(getStudents());
+      const [speakers, setSpeakersState] = React.useState(getSpeakers());
+      const [showRegister, setShowRegister] = React.useState(false);
+
+      // Sync shared data across windows (not sessions)
+      React.useEffect(() => {
+        const onStorage = (e) => {
+          if (e.key === 'speakers') setSpeakersState(safeParse(e.newValue, []));
+          else if (e.key === 'students') setStudentsState(safeParse(e.newValue, []));
+        };
+        window.addEventListener('storage', onStorage);
+        const iv = setInterval(() => { // periodic resilience
+          setSpeakersState(getSpeakers());
+          setStudentsState(getStudents());
+        }, 3000);
+        return () => { window.removeEventListener('storage', onStorage); clearInterval(iv); };
+      }, []);
+
+      // Auth handlers
+      const handleLogin = (u) => { setSessionUser(u); setUser(u); };
+      const handleLogout = () => { clearSessionUser(); setUser(null); };
+      const handleRegistered = (u) => { setShowRegister(false); setStudentsState(getStudents()); setSessionUser(u); setUser(u); };
+
+      // Queue handlers
+      const addSpeaker = (username, commentType) => {
+        const cleaned = username.trim();
+        if (!cleaned) return;
+        const updated = [...speakers, { username: cleaned, commentType }];
+        setSpeakersState(updated); setSpeakers(updated);
+      };
+      const removeSpeaker = (index) => {
+        const updated = speakers.filter((_, i) => i !== index);
+        setSpeakersState(updated); setSpeakers(updated);
+      };
+
+      // Routing
+      const manage = isManageMode();
+      const edit = isEditMode();
+
+      // Not logged in → login/register
+      if (!user) {
+        return showRegister
+          ? <RegisterScreen onRegistered={handleRegistered} onCancel={() => setShowRegister(false)} />
+          : <LoginScreen onLogin={handleLogin} onShowRegister={() => setShowRegister(true)} />;
+      }
+
+      // Header
+      const Header = (
+        <div className="w-full max-w-4xl flex justify-between mb-6">
+          <h1 className="text-3xl font-bold">{user}: Discussion Group Speaker Queue</h1>
+          <button onClick={handleLogout} className="px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">
+            Logout
+          </button>
+        </div>
+      );
+
+      // Admin-only pages
+      if (user === 'admin' && manage) {
+        return (
+          <div className="flex flex-col items-center w-full">
+            {Header}
+            <AdminPanel students={students} setStudentsState={setStudentsState} />
+          </div>
+        );
+      }
+      if (user === 'admin' && edit) {
+        return (
+          <div className="flex flex-col items-center w-full">
+            {Header}
+            <SpeakerList
+              speakers={speakers}
+              onAddSpeaker={() => {}}
+              onRemoveSpeaker={removeSpeaker}
+              user="admin"
+              showTitle="Edit Queue"
+            />
+          </div>
+        );
+      }
+
+      // Admin menu
+      if (user === 'admin') {
+        return (
+          <div className="flex flex-col items-center w-full">
+            {Header}
+            <AdminMenu />
+          </div>
+        );
+      }
+
+      // Regular user page
+      return (
+        <div className="flex flex-col items-center w-full">
+          {Header}
+          <TurnNotification
+            user={user}
+            speakers={speakers}
+            onStartSpeaking={(i) => {
+              const updated = speakers.filter((_, idx) => idx !== i);
+              setSpeakersState(updated); setSpeakers(updated);
+            }}
+          />
+          <SpeakerList
+            speakers={speakers}
+            onAddSpeaker={addSpeaker}
+            onRemoveSpeaker={removeSpeaker}
+            user={user}
+          />
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
